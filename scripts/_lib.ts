@@ -1,145 +1,103 @@
 /**
  * Shared utilities for scripts/deploy.ts.
  *
- * All Run402 interactions go through @run402/sdk/node — no execSync calls.
+ * All Run402 interactions go through `@run402/sdk/node` — no execSync calls.
  * Per the deploy spec policy, new tooling targeting Run402 must use the SDK.
  */
 
 import { execSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { join } from "node:path";
 
-import type { run402 } from "@run402/sdk/node";
+import { fileSetFromDir, run402 } from "@run402/sdk/node";
+import type { FileSet, FunctionSpec, ReleaseSpec } from "@run402/sdk/node";
 
-// Type extraction from the SDK's call sites — avoids deep-importing internal modules.
-// If the SDK reshapes its public method signatures, these break at compile time and
-// we know to update the script. That's the contract we want.
 type Run402Instance = ReturnType<typeof run402>;
-export type BundleDeployOptions = Parameters<Run402Instance["apps"]["bundleDeploy"]>[1];
-export type BundleFunctionSpec = NonNullable<NonNullable<BundleDeployOptions>["functions"]>[number];
-export type SiteFile = NonNullable<NonNullable<BundleDeployOptions>["files"]>[number];
-export type BundleRls = NonNullable<NonNullable<BundleDeployOptions>["rls"]>;
-
-/** File extensions we treat as UTF-8 text. Everything else is base64-encoded as binary. */
-const TEXT_EXTS = new Set([
-  ".html", ".htm", ".css", ".js", ".mjs", ".cjs", ".json", ".txt",
-  ".xml", ".svg", ".webmanifest", ".map", ".md", ".csv", ".yaml", ".yml",
-]);
-
-function isTextFile(name: string): boolean {
-  const dot = name.lastIndexOf(".");
-  if (dot < 0) return false;
-  return TEXT_EXTS.has(name.slice(dot).toLowerCase());
-}
-
-async function readAsSiteFile(absPath: string, relPath: string): Promise<SiteFile> {
-  const buf = await readFile(absPath);
-  if (isTextFile(relPath)) {
-    return { file: relPath, data: buf.toString("utf-8"), encoding: "utf-8" };
-  }
-  return { file: relPath, data: buf.toString("base64"), encoding: "base64" };
-}
+export type { FileSet, FunctionSpec, ReleaseSpec };
+export { fileSetFromDir };
 
 /**
- * Walk `root` and return SiteFile[] with POSIX-style relative paths.
- * Text files use utf-8 encoding; everything else is base64.
+ * Tables reachable via `/rest/v1/*`. Sent as `database.expose.tables: string[]`
+ * in the v2 release spec.
+ *
+ * Note: the SDK's `ExposeManifest.tables` type is `Array<Record<string, unknown>>`
+ * (matching the published schema at https://run402.com/schemas/manifest.v1.json,
+ * which describes objects with `{name, expose, policy}`), but the gateway
+ * runtime validator rejects that shape with `"tables must be an array of strings"`.
+ * Strings is what works today — see the friction note in `docs/run402-feedback.md`.
  */
-export async function collectFiles(root: string): Promise<SiteFile[]> {
-  if (!existsSync(root)) return [];
-  const out: SiteFile[] = [];
-  const walk = async (dir: string): Promise<void> => {
-    const entries = await readdir(dir, { withFileTypes: true });
-    for (const e of entries) {
-      const full = join(dir, e.name);
-      if (e.isDirectory()) {
-        await walk(full);
-      } else if (e.isFile()) {
-        const rel = relative(root, full).split(/[\\/]/).join("/");
-        out.push(await readAsSiteFile(full, rel));
-      }
-    }
-  };
-  await walk(root);
-  return out;
-}
+export const EXPOSE_TABLES: readonly string[] = [
+  "site_config",
+  "pages",
+  "sections",
+  "membership_tiers",
+  "member_custom_fields",
+  "announcements",
+  "activity_log",
+  "members",
+  "events",
+  "event_rsvps",
+  "resources",
+  "forum_categories",
+  "forum_topics",
+  "forum_replies",
+  "committees",
+  "committee_members",
+  "content_translations",
+  "moderation_log",
+  "member_insights",
+  "newsletter_drafts",
+  "reactions",
+];
 
 /**
  * Read functions from a directory of `.js` files. Each file becomes one
- * BundleFunctionSpec; cron schedules are parsed from `// schedule: "..."` comments.
+ * `FunctionSpec` in the `replace` map; cron schedules are parsed from
+ * `// schedule: "..."` comments.
  *
  * Honors two env-var overrides used by the demo deploys:
  *   - `EXCLUDE_FUNCTIONS=name1,name2` — skip these names
  *   - `EXTRA_FUNCTION=path/to/file.js` — append this single file as an extra function
  */
-export async function collectFunctions(dir: string): Promise<BundleFunctionSpec[]> {
-  const fns: BundleFunctionSpec[] = [];
+export async function collectFunctionsMap(
+  dir: string,
+): Promise<Record<string, FunctionSpec>> {
+  const out: Record<string, FunctionSpec> = {};
   if (existsSync(dir)) {
     const entries = await readdir(dir);
     for (const f of entries.filter((e) => e.endsWith(".js"))) {
       const code = await readFile(join(dir, f), "utf-8");
-      const fn = makeFunction(f.replace(/\.js$/, ""), code);
-      fns.push(fn);
+      out[f.replace(/\.js$/, "")] = makeFunctionSpec(code);
     }
   }
 
   const exclude = process.env["EXCLUDE_FUNCTIONS"];
-  let result = fns;
   if (exclude) {
-    const skip = new Set(exclude.split(",").map((s) => s.trim()));
-    result = result.filter((fn) => !skip.has(fn.name));
+    for (const name of exclude.split(",").map((s) => s.trim())) {
+      delete out[name];
+    }
   }
 
   const extra = process.env["EXTRA_FUNCTION"];
   if (extra) {
     const code = await readFile(extra, "utf-8");
     const name = (extra.split("/").pop() ?? extra).replace(/\.js$/, "");
-    result = [...result, makeFunction(name, code)];
+    out[name] = makeFunctionSpec(code);
   }
 
-  return result;
+  return out;
 }
 
-function makeFunction(name: string, code: string): BundleFunctionSpec {
+function makeFunctionSpec(code: string): FunctionSpec {
+  const spec: FunctionSpec = { runtime: "node22", source: code };
   const scheduleMatch = code.match(/\/\/\s*schedule:\s*"([^"]+)"/);
   if (scheduleMatch && scheduleMatch[1]) {
-    return { name, code, schedule: scheduleMatch[1] };
+    spec.schedule = scheduleMatch[1];
   }
-  return { name, code };
+  return spec;
 }
-
-/**
- * Shared RLS configuration. If a new table needs RLS, add it here.
- *
- * Template `public_read_authenticated_write` was renamed server-side from
- * `public_read` (see commit de160d2 + GH issue kychee-com/run402#108 history).
- */
-export const RLS_CONFIG: BundleRls = {
-  template: "public_read_authenticated_write",
-  tables: [
-    { table: "site_config" },
-    { table: "pages" },
-    { table: "sections" },
-    { table: "membership_tiers" },
-    { table: "member_custom_fields" },
-    { table: "announcements" },
-    { table: "activity_log" },
-    { table: "members" },
-    { table: "events" },
-    { table: "event_rsvps" },
-    { table: "resources" },
-    { table: "forum_categories" },
-    { table: "forum_topics" },
-    { table: "forum_replies" },
-    { table: "committees" },
-    { table: "committee_members" },
-    { table: "content_translations" },
-    { table: "moderation_log" },
-    { table: "member_insights" },
-    { table: "newsletter_drafts" },
-    { table: "reactions" },
-  ],
-};
 
 /** Run `npx astro build` from the repo root, streaming output. */
 export function buildAstro(): void {
@@ -217,14 +175,27 @@ export function readMigrations(root: string): string {
   return `${schema}\n\n${seed}`;
 }
 
+/** Lowercase hex SHA-256 of a string. Used to derive stable migration ids. */
+export function sha256Hex(s: string): string {
+  return createHash("sha256").update(s).digest("hex");
+}
+
 /**
  * Format an SDK error for human-readable console output. Distinguishes
- * PaymentRequired / Unauthorized / ApiError / NetworkError / LocalError so the
- * next-action message points at the right fix. Other Run402Error subclasses
- * (e.g. ProjectNotFound) fall through to the abstract-base handler.
+ * Run402DeployError / PaymentRequired / Unauthorized / ApiError /
+ * NetworkError / LocalError so the next-action message points at the
+ * right fix.
  */
 export async function prettyPrintError(err: unknown): Promise<string> {
   const sdk = await import("@run402/sdk");
+  if (err instanceof sdk.Run402DeployError) {
+    const fixHint = err.fix
+      ? `\n  Suggested fix: ${err.fix.action}${err.fix.path ? ` @ ${err.fix.path}` : ""}`
+      : "";
+    return (
+      `Deploy error [${err.code}] in phase "${err.phase}" (resource: ${err.resource}): ${err.message}${fixHint}`
+    );
+  }
   if (err instanceof sdk.PaymentRequired) {
     return (
       `Payment required (HTTP ${err.status ?? "?"}) while ${err.context}: ${err.message}\n` +

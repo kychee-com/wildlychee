@@ -24,16 +24,15 @@ if [ -d "$ASSETS_SRC" ]; then
   cp "$ASSETS_SRC"/* "$ASSETS_DST/"
 fi
 
-# Deploy site + images + seed (scripts/deploy.ts runs astro build + collects from dist/)
+# Deploy site + images + seed + reset-demo (single-shot via deploy.apply).
+# functions: { replace: ... } drops anything not in the map, so check-expirations
+# is removed implicitly by EXCLUDE_FUNCTIONS — no separate `run402 functions`
+# CLI step needed.
 cd "$ROOT"
 SEED_FILE="demo/eagles/seed.sql" RUN402_PROJECT_ID="$PROJECT_ID" SUBDOMAIN=eagles \
-  EXCLUDE_FUNCTIONS=check-expirations,reset-demo \
+  EXCLUDE_FUNCTIONS=check-expirations \
+  EXTRA_FUNCTION="demo/eagles/reset-demo.js" \
   npx tsx scripts/deploy.ts
-
-# Deploy reset-demo separately (too large for bundle deploy)
-echo "Deploying reset-demo function separately..."
-run402 functions update "$PROJECT_ID" check-expirations --schedule-remove 2>/dev/null || true
-run402 functions deploy "$PROJECT_ID" reset-demo --file "$SCRIPT_DIR/reset-demo.js" --schedule "0 * * * *"
 
 # Bootstrap demo accounts (idempotent — creates/links demo-admin + demo-member auth users)
 echo ""

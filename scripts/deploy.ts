@@ -1,11 +1,14 @@
 /**
  * Single-shot deploy entry point.
  *
- * Assembles the bundle (migrations + RLS + functions + files + subdomain) and
- * ships it via `apps.bundleDeploy()` in one HTTP call. With @run402/sdk@1.44.0
- * the gateway accepts ~50MB+ payloads, so the previous batched flow
- * (deploy-batched.ts) is gone — a single call covers the production site and
- * every demo (eagles ~68MB, silver-pines, barrio-unido).
+ * Builds a v2 `ReleaseSpec` (migrations + RLS expose + functions + site +
+ * subdomain) and ships it via `r.deploy.apply()` in one call. The CAS
+ * content service uploads only the bytes the gateway hasn't seen on a
+ * prior release — re-deploying an unchanged tree issues no S3 PUTs.
+ *
+ * Migrated from `apps.bundleDeploy()` (which is now a deprecated compat
+ * shim emitting a stale `expose.tables` shape the gateway rejects). See
+ * the friction note in `docs/run402-feedback.md`.
  *
  * Usage:
  *   npx tsx scripts/deploy.ts                                # production deploy
@@ -23,16 +26,16 @@ import { run402 } from "@run402/sdk/node";
 
 import {
   buildAstro,
-  collectFiles,
-  collectFunctions,
-  formatBytes,
+  collectFunctionsMap,
+  EXPOSE_TABLES,
+  fileSetFromDir,
   injectEnvJs,
   isDryRun,
   prettyPrintError,
   readMigrations,
   resolveDeployTarget,
-  RLS_CONFIG,
-  type BundleDeployOptions,
+  sha256Hex,
+  type ReleaseSpec,
 } from "./_lib.ts";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -47,73 +50,75 @@ async function main(): Promise<void> {
   const distDir = join(ROOT, "dist");
   injectEnvJs(distDir, target.anonKey);
 
-  const migrations = readMigrations(ROOT);
-  const files = await collectFiles(distDir);
-  const functions = await collectFunctions(join(ROOT, "functions"));
+  const sql = readMigrations(ROOT);
+  const migrationId = `kychon_${sha256Hex(sql).slice(0, 16)}`;
 
-  const opts: BundleDeployOptions = {
-    migrations,
-    rls: RLS_CONFIG,
-    files,
-    subdomain: target.subdomain,
-    inherit: true,
+  const fileSet = await fileSetFromDir(distDir);
+  const fileCount = Object.keys(fileSet).length;
+
+  const functionsMap = await collectFunctionsMap(join(ROOT, "functions"));
+  const fnNames = Object.keys(functionsMap);
+  const scheduledFns = fnNames.filter((n) => functionsMap[n]?.schedule);
+
+  // Type cast: SDK `ExposeManifest.tables` is `Array<Record<string, unknown>>`
+  // matching the published manifest schema, but the gateway runtime validator
+  // currently requires `string[]`. Probe-verified on 2026-04-29.
+  const expose = {
+    version: "1",
+    tables: EXPOSE_TABLES,
+  } as unknown as ReleaseSpec["database"] extends infer D
+    ? D extends { expose?: infer E }
+      ? E
+      : never
+    : never;
+
+  const spec: ReleaseSpec = {
+    project: target.projectId,
+    database: {
+      migrations: [{ id: migrationId, sql }],
+      expose,
+    },
+    site: { replace: fileSet },
+    subdomains: { set: [target.subdomain] },
   };
-  if (functions.length > 0) opts.functions = functions;
-
-  const payloadBytes = files.reduce((sum, f) => sum + f.data.length, 0);
-  const scheduledFns = functions.filter((f) => f.schedule);
+  if (fnNames.length > 0) {
+    spec.functions = { replace: functionsMap };
+  }
 
   console.log(
     `Deploying to ${target.projectId} (subdomain: ${target.subdomain})\n` +
-      `  ${files.length} site files (~${formatBytes(payloadBytes)} encoded)\n` +
-      `  ${functions.length} functions (${scheduledFns.length} scheduled)\n` +
-      `  ${migrations.length} migration bytes`,
+      `  ${fileCount} site files (lazy-streamed from ${distDir})\n` +
+      `  ${fnNames.length} functions (${scheduledFns.length} scheduled)\n` +
+      `  ${sql.length} migration bytes (id: ${migrationId})`,
   );
 
   if (dryRun) {
-    console.log("\n[dry-run] Would call apps.bundleDeploy with:");
+    console.log("\n[dry-run] Would call deploy.apply with:");
     const summary = {
       projectId: target.projectId,
-      subdomain: opts.subdomain,
-      inherit: opts.inherit,
-      filesCount: files.length,
-      filesEncodedBytes: payloadBytes,
-      functionsCount: functions.length,
-      functionsWithSchedule: scheduledFns.map((f) => `${f.name}=${f.schedule}`),
-      migrationsBytes: migrations.length,
-      rlsTemplate: opts.rls?.template,
-      rlsTables: opts.rls?.tables.length ?? 0,
+      subdomain: target.subdomain,
+      filesCount: fileCount,
+      functionsCount: fnNames.length,
+      functionsWithSchedule: scheduledFns.map(
+        (n) => `${n}=${functionsMap[n]?.schedule}`,
+      ),
+      migrationsBytes: sql.length,
+      migrationId,
+      exposeTables: EXPOSE_TABLES.length,
     };
     console.log(JSON.stringify(summary, null, 2));
     return;
   }
 
   const startedAt = Date.now();
-  const result = await r.apps.bundleDeploy(target.projectId, opts);
+  const result = await r.deploy.apply(spec);
   const elapsedMs = Date.now() - startedAt;
 
   console.log(`\nDeploy successful in ${(elapsedMs / 1000).toFixed(1)}s`);
-  if (result.subdomain_url) console.log(`  Live at: ${result.subdomain_url}`);
-  else if (result.site_url) console.log(`  Live at: ${result.site_url}`);
-  if (result.deployment_id) console.log(`  Deployment id: ${result.deployment_id}`);
-
-  const mig = result.migrations_result;
-  if (mig && (mig.tables_created.length > 0 || mig.columns_added.length > 0)) {
-    console.log(`  Migrations: ${mig.status}`);
-    if (mig.tables_created.length > 0) {
-      console.log(`    + tables: ${mig.tables_created.join(", ")}`);
-    }
-    if (mig.columns_added.length > 0) {
-      console.log(`    + columns: ${mig.columns_added.join(", ")}`);
-    }
-  }
-
-  if (result.functions && result.functions.length > 0) {
-    console.log("  Functions:");
-    for (const fn of result.functions) {
-      const sched = fn.schedule ? ` [schedule: ${fn.schedule}]` : "";
-      console.log(`    ${fn.name}${sched} → ${fn.url}`);
-    }
+  console.log(`  Release id: ${result.release_id}`);
+  console.log(`  Operation id: ${result.operation_id}`);
+  for (const [k, v] of Object.entries(result.urls)) {
+    console.log(`  ${k}: ${v}`);
   }
 }
 

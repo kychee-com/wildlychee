@@ -52,7 +52,9 @@ When npm refuses to install a recently-published SDK release because of a `befor
 
 ## Single-shot deploy
 
-The deploy is one HTTP call: `apps.bundleDeploy(projectId, { migrations, rls, functions, files, subdomain, inherit: true })`. No batching, no `sites.deploy()` follow-up. The legacy multi-call path (one bundle plus N file batches) was retired with SDK 1.44.0 — the 410 Gone removal of `sites.deploy()` made it unworkable, and the ~50MB+ payload ceiling on `apps.bundleDeploy` makes it unnecessary.
+The deploy goes through `r.deploy.apply(spec)` — the v2 unified deploy primitive. The SDK builds a `ReleaseSpec` (migrations, expose manifest, functions, site, subdomains), uploads bytes through CAS (only the SHAs the gateway hasn't seen), commits, and polls until `ready`. Re-deploying an unchanged tree issues no S3 PUTs.
+
+We migrated off `apps.bundleDeploy()` in 1.50.1 because the compat shim's `translateRlsToExpose` emits `{name, expose, policy}` objects (matching the published manifest schema at https://run402.com/schemas/manifest.v1.json) but the gateway runtime validator now rejects that shape with `"tables must be an array of strings"`. We send `tables: string[]` directly via `r.deploy.apply()` — probe-verified on 2026-04-29.
 
 ## Migration record
 
