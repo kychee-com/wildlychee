@@ -64,8 +64,11 @@ Users store `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` as project secrets. Schedule
 kychon/
 ├── astro.config.mjs       # Astro config: SSG, build.format: 'file', i18n
 ├── scripts/
-│   ├── deploy.ts          # Single-shot deploy via @run402/sdk/node (production + demos)
-│   └── _lib.ts            # Shared deploy helpers
+│   ├── deploy.ts          # Production deploy entry (kychon.run402.com)
+│   ├── deploy-demo.ts     # Per-demo orchestrator (asset copy + deploy + bootstrap)
+│   ├── deploy-all.ts      # Multi-demo dispatcher (called by deploy-all.sh)
+│   ├── bootstrap-demo.ts  # Demo account setup (signup, on-signup, role-set)
+│   └── _lib.ts            # Shared: runDeploy(), file collection, error formatting
 ├── schema.sql             # All tables (idempotent)
 ├── seed.sql               # Default config + sample data
 ├── src/
