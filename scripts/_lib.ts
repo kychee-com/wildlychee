@@ -1,5 +1,5 @@
 /**
- * Shared utilities for scripts/deploy.ts.
+ * Shared utilities for the deploy scripts.
  *
  * All Run402 interactions go through `@run402/sdk/node` — no execSync calls.
  * Per the deploy spec policy, new tooling targeting Run402 must use the SDK.
@@ -9,24 +9,28 @@ import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { fileSetFromDir, run402 } from "@run402/sdk/node";
 import type { FileSet, FunctionSpec, ReleaseSpec } from "@run402/sdk/node";
 
 type Run402Instance = ReturnType<typeof run402>;
-export type { FileSet, FunctionSpec, ReleaseSpec };
+export type { FileSet, FunctionSpec, ReleaseSpec, Run402Instance };
 export { fileSetFromDir };
+
+/** Repo root, derived from this file's location. */
+export const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 /**
  * Tables reachable via `/rest/v1/*`. Sent as `database.expose.tables: string[]`
  * in the v2 release spec.
  *
- * Note: the SDK's `ExposeManifest.tables` type is `Array<Record<string, unknown>>`
+ * The SDK's `ExposeManifest.tables` type is `Array<Record<string, unknown>>`
  * (matching the published schema at https://run402.com/schemas/manifest.v1.json,
  * which describes objects with `{name, expose, policy}`), but the gateway
  * runtime validator rejects that shape with `"tables must be an array of strings"`.
- * Strings is what works today — see the friction note in `docs/run402-feedback.md`.
+ * Strings is what works today — see kychee-com/run402#155 / #156.
  */
 export const EXPOSE_TABLES: readonly string[] = [
   "site_config",
@@ -52,17 +56,21 @@ export const EXPOSE_TABLES: readonly string[] = [
   "reactions",
 ];
 
+export interface CollectFunctionsOptions {
+  /** Function names to skip (e.g. `["check-expirations"]` for demos). */
+  exclude?: readonly string[];
+  /** Path to an additional `.js` function to append (e.g. demo reset-demo). */
+  extraFunction?: string;
+}
+
 /**
  * Read functions from a directory of `.js` files. Each file becomes one
  * `FunctionSpec` in the `replace` map; cron schedules are parsed from
  * `// schedule: "..."` comments.
- *
- * Honors two env-var overrides used by the demo deploys:
- *   - `EXCLUDE_FUNCTIONS=name1,name2` — skip these names
- *   - `EXTRA_FUNCTION=path/to/file.js` — append this single file as an extra function
  */
 export async function collectFunctionsMap(
   dir: string,
+  opts: CollectFunctionsOptions = {},
 ): Promise<Record<string, FunctionSpec>> {
   const out: Record<string, FunctionSpec> = {};
   if (existsSync(dir)) {
@@ -73,17 +81,13 @@ export async function collectFunctionsMap(
     }
   }
 
-  const exclude = process.env["EXCLUDE_FUNCTIONS"];
-  if (exclude) {
-    for (const name of exclude.split(",").map((s) => s.trim())) {
-      delete out[name];
-    }
+  if (opts.exclude) {
+    for (const name of opts.exclude) delete out[name];
   }
 
-  const extra = process.env["EXTRA_FUNCTION"];
-  if (extra) {
-    const code = await readFile(extra, "utf-8");
-    const name = (extra.split("/").pop() ?? extra).replace(/\.js$/, "");
+  if (opts.extraFunction) {
+    const code = await readFile(opts.extraFunction, "utf-8");
+    const name = (opts.extraFunction.split("/").pop() ?? opts.extraFunction).replace(/\.js$/, "");
     out[name] = makeFunctionSpec(code);
   }
 
@@ -102,13 +106,12 @@ function makeFunctionSpec(code: string): FunctionSpec {
 /** Run `npx astro build` from the repo root, streaming output. */
 export function buildAstro(): void {
   console.log("Building Astro project...");
-  execSync("npx astro build", { stdio: "inherit" });
+  execSync("npx astro build", { stdio: "inherit", cwd: ROOT });
 }
 
 /**
  * Inject the Run402 anon_key into `dist/js/env.js` after `astro build`.
- * Mirrors the runtime config the public site reads at boot. Creates `dist/js/`
- * if Astro hasn't already (no `public/js/` source means the dir is missing).
+ * Mirrors the runtime config the public site reads at boot.
  */
 export function injectEnvJs(distDir: string, anonKey: string): void {
   const jsDir = join(distDir, "js");
@@ -127,9 +130,9 @@ export interface ResolvedDeployTarget {
 }
 
 /**
- * Resolve the project id (env var → SDK active project), then fetch the
- * anon_key from the local keystore. Errors out with an actionable message
- * if either step fails.
+ * Resolve target from env vars (RUN402_PROJECT_ID / ANON_KEY / SUBDOMAIN),
+ * falling back to the SDK's active project + keystore. Used by `deploy.ts`
+ * (production deploy entry point).
  */
 export async function resolveDeployTarget(r: Run402Instance): Promise<ResolvedDeployTarget> {
   const fromEnv = process.env["RUN402_PROJECT_ID"];
@@ -166,10 +169,10 @@ export async function resolveDeployTarget(r: Run402Instance): Promise<ResolvedDe
   return { projectId, anonKey, subdomain };
 }
 
-/** Read schema.sql + seed.sql (or override) and concatenate. Returns inline migrations. */
-export function readMigrations(root: string): string {
+/** Read schema.sql + seed.sql (or override) and concatenate. Returns inline SQL. */
+export function readMigrations(root: string, seedFile?: string): string {
   const schemaPath = join(root, "schema.sql");
-  const seedPath = join(root, process.env["SEED_FILE"] ?? "seed.sql");
+  const seedPath = join(root, seedFile ?? "seed.sql");
   const schema = readFileSync(schemaPath, "utf-8");
   const seed = existsSync(seedPath) ? readFileSync(seedPath, "utf-8") : "";
   return `${schema}\n\n${seed}`;
@@ -178,6 +181,131 @@ export function readMigrations(root: string): string {
 /** Lowercase hex SHA-256 of a string. Used to derive stable migration ids. */
 export function sha256Hex(s: string): string {
   return createHash("sha256").update(s).digest("hex");
+}
+
+export interface RunDeployOptions {
+  projectId: string;
+  anonKey: string;
+  subdomain: string;
+  /** Path to a seed SQL file relative to repo root. Defaults to `seed.sql`. */
+  seedFile?: string;
+  /** Function names to skip. */
+  excludeFunctions?: readonly string[];
+  /** Path to an extra function file to add. */
+  extraFunction?: string;
+  /** When true, prints the assembled spec and returns without calling the API. */
+  dryRun?: boolean;
+}
+
+export interface RunDeployResult {
+  /** True for both real and dry-run successes. */
+  ok: true;
+  /** Present on real deploys; absent on dry-run. */
+  releaseId?: string;
+  operationId?: string;
+  urls?: Record<string, string>;
+  elapsedMs?: number;
+}
+
+/**
+ * High-level deploy: build Astro, assemble the v2 ReleaseSpec, and call
+ * `r.deploy.apply()`. Used by both `deploy.ts` (production) and
+ * `deploy-demo.ts` (per-demo orchestration).
+ */
+export async function runDeploy(
+  r: Run402Instance,
+  opts: RunDeployOptions,
+): Promise<RunDeployResult> {
+  buildAstro();
+
+  const distDir = join(ROOT, "dist");
+  injectEnvJs(distDir, opts.anonKey);
+
+  const sql = readMigrations(ROOT, opts.seedFile);
+  const migrationId = `kychon_${sha256Hex(sql).slice(0, 16)}`;
+
+  const fileSet = await fileSetFromDir(distDir);
+  const fileCount = Object.keys(fileSet).length;
+
+  const collectOpts: CollectFunctionsOptions = {};
+  if (opts.excludeFunctions) collectOpts.exclude = opts.excludeFunctions;
+  if (opts.extraFunction) collectOpts.extraFunction = opts.extraFunction;
+  const functionsMap = await collectFunctionsMap(join(ROOT, "functions"), collectOpts);
+  const fnNames = Object.keys(functionsMap);
+  const scheduledFns = fnNames.filter((n) => functionsMap[n]?.schedule);
+
+  // SDK type says `Array<Record<string, unknown>>`; gateway requires `string[]`.
+  // See kychee-com/run402#155 / #156.
+  const expose = {
+    version: "1",
+    tables: EXPOSE_TABLES,
+  } as unknown as ReleaseSpec["database"] extends infer D
+    ? D extends { expose?: infer E }
+      ? E
+      : never
+    : never;
+
+  const spec: ReleaseSpec = {
+    project: opts.projectId,
+    database: {
+      migrations: [{ id: migrationId, sql }],
+      expose,
+    },
+    site: { replace: fileSet },
+    subdomains: { set: [opts.subdomain] },
+  };
+  if (fnNames.length > 0) {
+    spec.functions = { replace: functionsMap };
+  }
+
+  console.log(
+    `Deploying to ${opts.projectId} (subdomain: ${opts.subdomain})\n` +
+      `  ${fileCount} site files (lazy-streamed from ${distDir})\n` +
+      `  ${fnNames.length} functions (${scheduledFns.length} scheduled)\n` +
+      `  ${sql.length} migration bytes (id: ${migrationId})`,
+  );
+
+  if (opts.dryRun) {
+    console.log("\n[dry-run] Would call deploy.apply with:");
+    console.log(
+      JSON.stringify(
+        {
+          projectId: opts.projectId,
+          subdomain: opts.subdomain,
+          filesCount: fileCount,
+          functionsCount: fnNames.length,
+          functionsWithSchedule: scheduledFns.map(
+            (n) => `${n}=${functionsMap[n]?.schedule}`,
+          ),
+          migrationsBytes: sql.length,
+          migrationId,
+          exposeTables: EXPOSE_TABLES.length,
+        },
+        null,
+        2,
+      ),
+    );
+    return { ok: true };
+  }
+
+  const startedAt = Date.now();
+  const result = await r.deploy.apply(spec);
+  const elapsedMs = Date.now() - startedAt;
+
+  console.log(`\nDeploy successful in ${(elapsedMs / 1000).toFixed(1)}s`);
+  console.log(`  Release id: ${result.release_id}`);
+  console.log(`  Operation id: ${result.operation_id}`);
+  for (const [k, v] of Object.entries(result.urls)) {
+    console.log(`  ${k}: ${v}`);
+  }
+
+  return {
+    ok: true,
+    releaseId: result.release_id,
+    operationId: result.operation_id,
+    urls: result.urls,
+    elapsedMs,
+  };
 }
 
 /**
